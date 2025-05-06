@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Lambda functions and IAM roles for LINE AWS Usage Tracker"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket for storing reports
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+
+  MonthlyUpdateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-monthly-update"
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  current_date = datetime.now()
+                  year = str(current_date.year)
+                  month = str(current_date.month).zfill(2)
+                  
+                  bucket_name = os.environ['S3_BUCKET_NAME']
+                  key = f"cur-reports/{year}/{month}/cost-report.csv"
+                  
+                  metadata = {
+                      'last_update': current_date.isoformat(),
+                      'year': year,
+                      'month': month
+                  }
+                  
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key='metadata/last-update.json',
+                      Body=json.dumps(metadata),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Monthly update completed successfully',
+                          'metadata': metadata
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': 'Error occurred during monthly update',
+                          'error': str(e)
+                      })
+                  }
+
+  QueryHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-query-handler"
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket_name = os.environ['S3_BUCKET_NAME']
+                  
+                  metadata_response = s3.get_object(
+                      Bucket=bucket_name,
+                      Key='metadata/last-update.json'
+                  )
+                  metadata = json.loads(metadata_response['Body'].read().decode('utf-8'))
+                  
+                  year = metadata['year']
+                  month = metadata['month']
+                  report_key = f"cur-reports/{year}/{month}/cost-report.csv"
+                  
+                  report_response = s3.get_object(
+                      Bucket=bucket_name,
+                      Key=report_key
+                  )
+                  report_content = report_response['Body'].read().decode('utf-8')
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Query processed successfully',
+                          'data': {
+                              'last_update': metadata['last_update'],
+                              'report_content': report_content
+                          }
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': 'Error occurred while processing query',
+                          'error': str(e)
+                      })
+                  }
+
+  MonthlyUpdateSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Schedule for monthly cost report updates
+      ScheduleExpression: cron(0 0 1 * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonthlyUpdateFunction.Arn
+          Id: MonthlyUpdateTarget
+
+  MonthlyUpdatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MonthlyUpdateFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyUpdateSchedule.Arn
+
+Outputs:
+  MonthlyUpdateFunctionArn:
+    Description: ARN of the monthly update Lambda function
+    Value: !GetAtt MonthlyUpdateFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MonthlyUpdateFunctionArn"
+
+  QueryHandlerFunctionArn:
+    Description: ARN of the query handler Lambda function
+    Value: !GetAtt QueryHandlerFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-QueryHandlerFunctionArn"
